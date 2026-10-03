@@ -150,6 +150,7 @@ pub(crate) async fn spawn(
     };
     // Call the shared native backend directly: the helper needs no child callbacks.
     // Unsupported libc/platform setup falls back at the original target boundary.
+    crate::diagnostics::stage(diagnostics, "helper-native-spawn-begin");
     let child = match crate::child::posix::NativeChild::spawn(&helper) {
         Ok(Some(child)) => child,
         Ok(None) => {
@@ -161,6 +162,8 @@ pub(crate) async fn spawn(
             return Ok(None);
         }
     };
+    let helper_pid = child.id();
+    crate::diagnostics::child_started("helper-native-spawned", helper_pid);
     drop(helper);
     drop(helper_control);
     // All inherited descriptors were passed to the helper synchronously, before
@@ -179,11 +182,24 @@ pub(crate) async fn spawn(
         crate::diagnostics::stage(diagnostics, "helper-no-exec-acknowledgement");
         if diagnostics && let Some(child) = starting.0.as_mut() {
             match tokio::time::timeout(std::time::Duration::from_millis(500), child.wait()).await {
-                Ok(Ok(status)) => crate::diagnostics::wait_status("helper-bootstrap-wait", status),
+                Ok(Ok(status)) => {
+                    crate::diagnostics::wait_status("helper-bootstrap-wait", helper_pid, status)
+                }
                 Ok(Err(error)) => {
                     crate::diagnostics::failure(diagnostics, "helper-bootstrap-wait", &error)
                 }
                 Err(_) => crate::diagnostics::stage(diagnostics, "helper-bootstrap-wait-timeout"),
+            }
+            if let Some(stderr) = child.stderr.as_mut() {
+                // The target has not execed: retain only the helper's fixed stages
+                // before dropping its pipes and taking the compatibility fallback.
+                let mut output = Vec::new();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    stderr.take(8192).read_to_end(&mut output),
+                )
+                .await;
+                crate::diagnostics::forward_helper_stages(helper_pid, &output);
             }
         }
         // Bootstrap can fail before dispatch (for example in the dynamic loader).

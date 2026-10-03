@@ -11,6 +11,7 @@ use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::time::Duration;
 
+use anyhow::Context;
 use pretty_assertions::assert_eq;
 
 use crate::spawn_pipe_process;
@@ -23,10 +24,15 @@ const CHILD_FIXTURE: &str = "--codex-spawn-test-child";
 fn initialize_spawn_helper() {
     if let Ok(arguments) = std::fs::read("/proc/self/cmdline") {
         let mut arguments = arguments.split(|byte| *byte == 0).skip(1);
+        let diagnostics = arguments.clone().any(|arg| arg == b"diagnostics");
         if arguments.next() == Some(crate::spawn_helper::HELPER_ARG.as_bytes())
             && arguments.any(|arg| arg == b"--codex-test-fail-helper-bootstrap")
         {
             // Simulate a loader failure before the helper can report setup.
+            if diagnostics {
+                crate::diagnostics::stage(true, "helper-descriptor-cleanup");
+                eprintln!("private helper stderr must not be forwarded");
+            }
             std::process::exit(127);
         }
     }
@@ -114,6 +120,67 @@ fn initialize_spawn_helper() {
         }
         std::process::exit(0);
     }
+}
+
+#[test]
+fn failed_helper_retains_stages_and_suppresses_arbitrary_stderr() -> anyhow::Result<()> {
+    const FIXTURE: &str = "CODEX_TEST_FAILED_HELPER_DIAGNOSTICS";
+    if std::env::var_os(FIXTURE).is_some() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        return runtime.block_on(async {
+            let mut child = spawn_pipe_process_no_stdin(
+                "/bin/echo",
+                &["--codex-test-fail-helper-bootstrap".into()],
+                Path::new("/"),
+                &HashMap::new(),
+                &None,
+                &[],
+            )
+            .await?;
+            let mut output = Vec::new();
+            while let Some(bytes) = child.stdout_rx.recv().await {
+                output.extend(bytes);
+            }
+            assert_eq!(child.exit_rx.await?, 0);
+            assert_eq!(output, b"--codex-test-fail-helper-bootstrap\n");
+            anyhow::Ok(())
+        });
+    }
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "spawn_helper_tests::failed_helper_retains_stages_and_suppresses_arbitrary_stderr",
+            "--nocapture",
+        ])
+        .env(FIXTURE, "1")
+        .env(crate::diagnostics::ENV_VAR, "1")
+        .output()?;
+    anyhow::ensure!(output.status.success(), "{output:?}");
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    let Some(started) = stderr
+        .lines()
+        .find(|line| line.contains("stage=helper-native-spawned"))
+    else {
+        eprintln!("skipping helper diagnostic test: native spawning is unavailable");
+        return Ok(());
+    };
+    let child_pid = started
+        .split_whitespace()
+        .find_map(|field| {
+            field
+                .strip_prefix("child_pid=Some(")
+                .and_then(|pid| pid.strip_suffix(')'))
+        })
+        .context("helper diagnostic must include its actual PID")?
+        .parse::<u32>()?;
+    assert!(stderr.contains(&format!(
+        "child_pid=Some({child_pid}) stage=helper-descriptor-cleanup",
+    )));
+    assert!(stderr.contains("stage=helper-bootstrap-wait"));
+    assert!(!stderr.contains("private helper stderr must not be forwarded"));
+    Ok(())
 }
 
 /// Pin a process identity so exit observation and cleanup cannot follow PID reuse.

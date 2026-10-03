@@ -293,6 +293,7 @@ impl Command {
         });
         #[cfg(unix)]
         {
+            let diagnostics = crate::diagnostics::enabled();
             let new_session = matches!(self.process_mode, ProcessMode::NewSession);
             let explicit_fds = self.descriptor_policy == DescriptorPolicy::Explicit;
             let targets = self.inherited_fds;
@@ -307,19 +308,37 @@ impl Command {
                 // allocation-after-fork risk documented on close_inherited_fds_except.
                 unsafe {
                     self.inner.pre_exec(move || {
+                        crate::diagnostics::pre_exec_stage(diagnostics, b"compat-child-entry");
                         if new_session {
+                            crate::diagnostics::pre_exec_stage(diagnostics, b"compat-child-setsid");
                             crate::process_group::detach_from_tty()?;
                         }
                         if let Some(parent_pid) = parent_pid {
+                            crate::diagnostics::pre_exec_stage(
+                                diagnostics,
+                                b"compat-child-parent-death-signal",
+                            );
                             crate::process_group::set_parent_death_signal(parent_pid)?;
                         }
                         if explicit_fds {
+                            crate::diagnostics::pre_exec_stage(
+                                diagnostics,
+                                b"compat-child-descriptor-cleanup",
+                            );
                             #[cfg(target_os = "linux")]
                             crate::pty::close_inherited_fds_except(&targets)?;
                             #[cfg(not(target_os = "linux"))]
                             crate::pty::close_inherited_fds_except(&targets);
                         }
+                        crate::diagnostics::pre_exec_stage(
+                            diagnostics,
+                            b"compat-child-inherit-descriptors",
+                        );
                         crate::pty::make_fds_inheritable(&targets)?;
+                        crate::diagnostics::pre_exec_stage(
+                            diagnostics,
+                            b"compat-child-setup-complete",
+                        );
                         Ok(())
                     });
                 }
@@ -339,7 +358,13 @@ impl Command {
             ChildDropPolicy::KillAndReap => None,
             ChildDropPolicy::ReapOnly => Some(crate::child::reaper::sender()?),
         };
-        let mut child = self.inner.spawn()?;
+        let diagnostics = crate::diagnostics::enabled();
+        #[cfg(target_os = "linux")]
+        crate::diagnostics::stage(diagnostics, "compat-spawn-begin");
+        let mut child = self.inner.spawn().inspect_err(|error| {
+            crate::diagnostics::failure(diagnostics, "compat-spawn", error);
+        })?;
+        crate::diagnostics::child_started("compat-spawned", child.id());
         Ok(Child {
             stdin: child.stdin.take(),
             stdout: child.stdout.take(),

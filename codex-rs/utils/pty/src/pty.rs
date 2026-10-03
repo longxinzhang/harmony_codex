@@ -393,6 +393,10 @@ async fn spawn_process_preserving_fds(
                 return spawn_process_portable(program, args, cwd, env, arg0, size).await;
             }
             None => {
+                crate::diagnostics::stage(
+                    crate::diagnostics::enabled(),
+                    "pty-compatibility-fallback",
+                );
                 // Keep OHOS on the checked descriptor path even for an empty
                 // allowlist; portable-pty cannot report incomplete cleanup.
                 // Keep terminal setup when this executable cannot run the helper.
@@ -436,6 +440,11 @@ async fn spawn_process_preserving_fds(
         .ok_or_else(|| std::io::Error::other("missing child pid"))?;
     #[cfg(not(target_os = "linux"))]
     let process_group_id = child.id();
+    #[cfg(target_os = "linux")]
+    let child_pid = Some(process_group_id);
+    #[cfg(not(target_os = "linux"))]
+    let child_pid = Some(child.id());
+    crate::diagnostics::child_started("pty-spawned", child_pid);
 
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
@@ -449,7 +458,7 @@ async fn spawn_process_preserving_fds(
     let wait_exit_code = Arc::clone(&exit_code);
     let on_exit = move |status: std::io::Result<std::process::ExitStatus>| {
         match &status {
-            Ok(status) => crate::diagnostics::wait_status("pty-wait", *status),
+            Ok(status) => crate::diagnostics::wait_status("pty-wait", child_pid, *status),
             Err(error) => {
                 crate::diagnostics::failure(crate::diagnostics::enabled(), "pty-wait", error)
             }

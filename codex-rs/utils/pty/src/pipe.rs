@@ -176,10 +176,18 @@ async fn spawn_process_with_stdin_mode(
     let mut child =
         match crate::spawn_helper::spawn(&command, crate::spawn_helper::Setup::Pipe).await? {
             Some(child) => child,
-            None => command.spawn()?,
+            None => {
+                crate::diagnostics::stage(
+                    crate::diagnostics::enabled(),
+                    "pipe-compatibility-fallback",
+                );
+                command.spawn()?
+            }
         };
     #[cfg(not(target_os = "linux"))]
     let mut child = command.spawn()?;
+    let child_pid = child.id();
+    crate::diagnostics::child_started("pipe-spawned", child_pid);
     #[cfg(windows)]
     let windows_terminator = {
         // Accept the small race: a descendant created between spawn and
@@ -279,7 +287,7 @@ async fn spawn_process_with_stdin_mode(
                         "Windows pipe failed to preserve descendants after root exit: {err}"
                     );
                 }
-                crate::diagnostics::wait_status("pipe-wait", status);
+                crate::diagnostics::wait_status("pipe-wait", child_pid, status);
                 exit_code_from_status(status)
             }
             Err(error) => {
